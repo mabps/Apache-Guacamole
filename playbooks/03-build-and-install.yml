@@ -1,0 +1,229 @@
+---
+- name: "03 - Сборка и установка guacamole-server и guacamole-client"
+  hosts: guacamole_servers
+  gather_facts: yes
+  become: yes
+  vars:
+    # Параметры сборки guacamole-server
+    configure_options: >
+        --with-systemd-dir=/etc/systemd/system
+        CFLAGS="-Wno-deprecated-declarations"
+    daemon_home_dir: "/var/lib/guacd"
+    guacd_user: "daemon"    # По умолчанию данная служба запускается от имени пользователя daemon, но от этого пользователя он не может делать nslookup  и некоторые другие операции - поэтому иногда выгодно ему поставить root пользователя
+
+
+
+  tasks:
+
+# ---------- guacamole-server ----------
+    - name: "Запуск configure для guacamole-server"
+      command:
+        chdir: "{{ distr_dir }}/guacamole-server-{{ guacamole_version }}"
+        cmd: "./configure {{ configure_options }}"
+      args:
+        creates: "{{ distr_dir }}/guacamole-server-{{ guacamole_version }}/Makefile"
+
+    - name: "Сборка guacamole-server (make)"
+      make:
+        chdir: "{{ distr_dir }}/guacamole-server-{{ guacamole_version }}"
+        target: all
+        params:
+          NUM_THREADS: "{{ ansible_processor_cores }}"
+
+    - name: "Установка guacamole-server (make install)"
+      make:
+        chdir: "{{ distr_dir }}/guacamole-server-{{ guacamole_version }}"
+        target: install
+
+    - name: "Обновление кэша динамических библиотек"
+      command: ldconfig
+
+
+# ---------- guacamole-client ----------
+
+#Прописываем необходимые параметры окружающей среды для JAVA
+    - name: Получить реальный путь к исполняемому файлу java
+      ansible.builtin.shell:
+        cmd: "readlink -f /usr/bin/java"
+      register: java_real_path
+      changed_when: false
+
+    - name: Извлечь JAVA_HOME (два уровня вверх от bin/java)
+      ansible.builtin.set_fact:
+        java_home: "{{ java_real_path.stdout | dirname | dirname }}"
+      when:
+        - java_real_path.stdout != ""
+
+    - name: Создать /etc/profile.d/java.sh (для login-сессий)- обновление переменных окружающей среды
+      ansible.builtin.copy:
+        dest: /etc/profile.d/java.sh
+        content: |
+          export JAVA_HOME={{ java_home }}
+          export PATH=$JAVA_HOME/bin:$PATH
+        mode: '0644'
+      when:
+        - java_home is defined
+
+    - name: Добавить JAVA_HOME в /etc/environment (для systemd и cron)
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        regexp: '^JAVA_HOME='
+        line: 'JAVA_HOME="{{ java_home }}"'
+        create: yes
+        mode: '0644'
+      when:
+        - java_home is defined
+
+    - name: Обновляем системную переменную PATH, для текущего сеанса, дописывая туда ссылку на бинарники JAVA
+      ansible.builtin.shell: |
+          export JAVA_HOME={{ java_home }}
+          export PATH=$JAVA_HOME/bin:$PATH
+
+    - name: Устанавливаем нужный пакет JAVA = jsdoc
+      ansible.builtin.shell:
+        cmd: "npm install -g jsdoc"
+#Конец блока
+
+    - name: "Сборка guacamole-client (Maven)"
+      command:
+        chdir: "{{ distr_dir }}/guacamole-client-{{ guacamole_version }}"
+        cmd: "mvn clean compile -DskipTests"
+      environment:
+        MAVEN_OPTS: "-Xmx1024m"
+
+    - name: Установить права 777 для каталога
+      ansible.builtin.file:
+        path: "{{ distr_dir }}"
+        state: directory
+        mode: '0777'
+        recurse: yes
+
+    - name: "Упаковка guacamole-client (Maven package)"
+      command:
+        chdir: "{{ distr_dir }}/guacamole-client-{{ guacamole_version }}"
+        cmd: "mvn package -DskipTests"
+      environment:
+        MAVEN_OPTS: "-Xmx1024m"
+        JAVA_HOME: "{{ java_home }}"
+
+    - name: "Поиск собранного WAR-файла"
+      find:
+        paths: "{{ distr_dir }}/guacamole-client-{{ guacamole_version }}/guacamole/target"
+        patterns: "guacamole-*.war"
+      register: war_file
+
+#Найти директорию запущенного Tomcat и передать адрес директории дальше в обработку
+ # 1. Найти PID процесса, слушающего TCP порт 8080
+    - name: "Получить PID процесса на порту 8080"
+      ansible.builtin.shell:
+        cmd: ss -tlnp | grep ':8080' | grep -oP 'pid=\K[0-9]+' | head -1
+      register: pid_result
+      changed_when: false
+
+    # 2. Если PID найден – получить полную командную строку процесса
+    - name: "Получить командную строку процесса (если PID найден)"
+      ansible.builtin.shell:
+        cmd: ps -p {{ pid_result.stdout }} -o cmd 2>/dev/null
+      register: cmd_result
+      when: pid_result.stdout != ""
+      changed_when: false
+
+    # 3. Извлечь значение параметра -Dcatalina.base=...
+    - name: Определяем домашнюю директорию для TomCat и записываем в переменную
+      ansible.builtin.set_fact:
+       install_dir: "{{ cmd_result.stdout | regex_search('-Dcatalina.base=([^ ]+)', '\\1') | first  }}"
+
+    # Для Томкат11 - папка куда нужно сложить WAR файл = /var/lib/tomcat11/webapps/
+    - name: Отладка - вывод значения переменной install_dir
+      ansible.builtin.debug:
+        msg: "Значение install_dir: {{ install_dir }}"
+#Конец
+
+    - name: "Записываем в переменню место размещения будущего файла приложения Apache Guacamole"
+      ansible.builtin.set_fact:
+       guacamole_webapps: "{{install_dir}}/webapps/guacamole.war"
+
+    - name: Отладка - вывод значения переменной guacamole_webapps
+      ansible.builtin.debug:
+        msg: "Значение guacamole_webapps: {{ guacamole_webapps }}"
+
+
+    - name: "Конвертация WAR-файла в Jakarta (для Tomcat ), и копирование в нужную директорию, с нужным именем файла"
+      command:
+        cmd: "javax2jakarta {{ war_file.files[0].path }} {{ guacamole_webapps }}"
+
+    - name: "Меняем разрешения на файл"
+      ansible.builtin.file:
+        path: "{{ guacamole_webapps }}"
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0755'        # или 'u=rwx,g=rx,o=rx'
+
+    - name: "Создание каталога для конфигурации Guacamole"
+      file:
+        path: "{{item}}"
+        state: directory
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0755'
+      with_items:
+       - /etc/guacamole/extensions
+       - /etc/guacamole/lib
+
+    - name: "Создание файла конфигурации guacamole.properties"
+      copy:
+        dest: /etc/guacamole/guacamole.properties
+        content: |
+          # Базовые настройки Guacamole
+          # Здесь можно добавить параметры аутентификации (например, для MySQL/PostgreSQL), здесь он пока пустой - заполняется в следующих плейбуках
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0755'
+
+######
+    - name: "Создаем домашнюю директорию для пользователя daemon = {{daemon_home_dir}}"
+      ansible.builtin.file:
+        path: "{{daemon_home_dir}}"
+        state: directory
+        owner: daemon
+        group: daemon
+        mode: '0755'
+
+    - name: "Устанавливаем для пользователя daemon домашнюю директорию = {{daemon_home_dir}}"
+      ansible.builtin.user:
+        name: daemon
+        home: "{{daemon_home_dir}}"
+
+    - name: "Устанавливаем от имени какого пользователя должен запускаться guacd = {{guacd_user}}"
+      ansible.builtin.ini_file:
+        path: /etc/systemd/system/guacd.service
+        section: Service
+        option: User
+        value: "{{ guacd_user }}"
+        backup: true
+
+    - name: "Прописываем домашнюю директорию через ini_file"
+      ansible.builtin.ini_file:
+        path: /etc/systemd/system/guacd.service
+        section: Service
+        option: Environment
+        value: '"HOME={{ daemon_home_dir }}"'
+        backup: true
+
+    - name: "Переиндексируем файлы конфигурации служб - так как мы возможно делали там изменения"
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: "Запуск и включение Tomcat"
+      systemd:
+        name: "{{tomcat_version}}"
+        state: started
+        enabled: yes
+
+    - name: "Запуск и включение guacd (служба Guacamole которая проксирует подключения)"
+      systemd:
+        name: guacd
+        state: started
+        enabled: yes
+
+

@@ -1,0 +1,49 @@
+---
+- name: "02 - Скачивание исходных кодов Guacamole"
+  hosts: guacamole_servers
+  gather_facts: yes
+  become: yes
+
+  tasks:
+    - name: "Определение актуальной версии (если не задана)"
+      set_fact:
+        guacamole_version: "{{ lookup('pipe', 'curl -s https://api.github.com/repos/apache/guacamole-server/tags | grep -oP '\\\"name\\\":\\\"\\K[0-9.]+(?=\\\")' | head -1') }}"
+      when: guacamole_version is not defined or guacamole_version == ""
+
+    - name: "Вывод версии"
+      debug:
+        msg: "Будет установлена Guacamole версия {{ guacamole_version }}"
+
+    - name: "Скачивание guacamole-server"
+      get_url:
+        url: "https://downloads.apache.org/guacamole/{{ guacamole_version }}/source/guacamole-server-{{ guacamole_version }}.tar.gz"
+        dest: "{{ distr_dir }}/guacamole-server-{{ guacamole_version }}.tar.gz"
+        mode: '0644'
+      register: download_server
+      until: download_server is succeeded
+      retries: 3
+      delay: 5
+
+    - name: "Распаковка guacamole-server"
+      unarchive:
+        src: "{{ distr_dir }}/guacamole-server-{{ guacamole_version }}.tar.gz"
+        dest: "{{ distr_dir }}"
+        remote_src: yes
+        creates: "{{ distr_dir }}/guacamole-server-{{ guacamole_version }}"
+
+    - name: "Скачивание guacamole-client (исходники)"
+      get_url:
+        url: "https://downloads.apache.org/guacamole/{{ guacamole_version }}/source/guacamole-client-{{ guacamole_version }}.tar.gz"
+        dest: "{{ distr_dir }}/guacamole-client-{{ guacamole_version }}.tar.gz"
+        mode: '0644'
+      register: download_client
+      until: download_client is succeeded
+      retries: 3
+      delay: 5
+
+    - name: "Распаковка guacamole-client"
+      unarchive:
+        src: "{{ distr_dir }}/guacamole-client-{{ guacamole_version }}.tar.gz"
+        dest: "{{ distr_dir }}"
+        remote_src: yes
+        creates: "{{ distr_dir }}/guacamole-client-{{ guacamole_version }}"

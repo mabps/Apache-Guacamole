@@ -1,0 +1,26 @@
+---
+# Тестирование проводилось только для Debian13, на других дистрибутивах нужно будет поменять наименование\версии устанавливаемых сопутсвующих пакетов
+all:
+  children:
+    guacamole_servers:
+      hosts:
+        guacamole-server:
+          ansible_host: 192.168.0.1
+          ansible_user: avmat
+#          ansible_ssh_pass: XXX
+#          ansible_become_password: XXX
+          become: yes
+          become_user: su
+          become_method: sudo
+          guacamole_version: 1.6.0
+          distr_dir: /distr   			# Переменная указывает в какую папку будут скачиваться дистрибутивы
+          tomcat_version: tomcat11		# Версия ТомКат сервера, он же runtime enviroment для запуска JAVA приложений
+          freerdp_version: freerdp2     # Важно !!! - на текущий момент 2026-08-08 Guacamole 1.6.0 не умеет работать с freerdp3 - в частности не работает запуск терминальных приложений (RemoteAPP), поэтому ставим устаревший пакет!
+          tomcat_user: tomcat
+          tomcat_group: tomcat
+          server_AltNameDNS: XXX.ru
+          postgresql_user: guacamole_user
+          postgresql_password: XXXXXXXXXXXXXX   # пароль для интеграции Guacamole c БД
+          postgresql_jdbc_driver_url: https://jdbc.postgresql.org/download/postgresql-42.7.11.jar   # Очень сложно динамически определить какая нужна библиотека - поэтому задаем вручную
+  vars:
+    ansible_python_interpreter: /usr/bin/python3

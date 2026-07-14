@@ -1,0 +1,129 @@
+---
+- name: "01 - Подготовка операционной системы"
+  hosts: guacamole_servers
+  gather_facts: yes
+  become: yes
+
+  tasks:
+    # Есть проблема - на текущий момент Guacamole v.1.6.0 не в полной мере поддерживает пакет freerdp3, так например не работает функциональность запуска RemoteAPP, поэтому мы устанавливаем старый пакет FreeRDP2
+    - name: "Если в настройках стоит устновка freerdp2 - то выполняется этот блок"
+      block:
+          - name: "Add bookworm-proposed-updates repository"
+            ansible.builtin.apt_repository:
+                repo: "{{ item }}"
+                state: present
+                update_cache: true
+            loop:
+              - deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+              - deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+              - deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+
+          - name: "Create apt preferences to pin FreeRDP2 packages"
+            ansible.builtin.copy:
+                dest: /etc/apt/preferences.d/freerdp2
+                content: |
+                  Package: freerdp2* libfreerdp* libwinpr*
+                  Pin: release n=bookworm-proposed-updates
+                  Pin-Priority: 1010
+                mode: '0644'
+
+          - name: "Install freerdp2-dev specific version"
+            ansible.builtin.apt:
+                name: freerdp2-dev
+                state: present
+                update_cache: true
+      when: freerdp_version == 'freerdp2'
+
+
+    - name: "Обновление списка пакетов"
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: "Установка базовых пакетов и зависимостей сборки"
+      apt:
+        name:
+          # Базовые инструменты
+          - build-essential
+          - gcc
+          - make
+          - libtool-bin
+          - pkg-config
+          - wget
+          - curl
+          - git
+          - unzip
+          - sudo
+          # Строго обязательные зависимости (Cairo, libjpeg, libpng, libuuid)
+          - libcairo2-dev
+          - libjpeg62-turbo-dev
+          - libpng-dev
+          - uuid-dev
+          - libossp-uuid-dev
+          # Дополнительные зависимости для протоколов (VNC, SSH, Telnet и др.)
+          - libvncserver-dev
+          - libssh2-1-dev
+          - libssl-dev
+          - libtelnet-dev
+          - libpango1.0-dev
+          - libwebsockets-dev
+          # Зависимости для аудио и видео
+          - libavcodec-dev
+          - libavformat-dev
+          - libavutil-dev
+          - libswscale-dev
+          - libvorbis-dev
+          - libwebp-dev
+          - libpulse-dev
+          # Для сборки guacamole-client (Maven)
+          - maven
+          - default-jdk-headless
+          # Веб-сервер Tomcat 11
+          - "{{tomcat_version}}"
+          - "{{tomcat_version}}-admin"
+          # Инструмент для конвертации WAR в Jakarta
+          - tomcat-jakartaee-migration
+          - "{{freerdp_version}}-dev"
+          - "{{freerdp_version}}-x11"
+          - npm
+          - openssl
+        state: present
+        update_cache: yes
+
+    - name: "Создание группы и пользователя для Tomcat (если не существуют)"
+      group:
+        name: "{{ tomcat_group }}"
+        state: present
+      when: tomcat_group is defined
+
+    - name: "Создание пользователя Tomcat"
+      user:
+        name: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        shell: /bin/false
+        create_home: no
+        system: yes
+      when: tomcat_user is defined
+
+    - name: "Создание директории для дистрибутивов"
+      file:
+        path: "{{ distr_dir }}"
+        state: directory
+        mode: '0755'
+
+# sysctl -w net.ipv6.conf.default.disable_ipv6=1
+# sysctl -w net.ipv6.conf.all.disable_ipv6=1
+
+    - name: "Отключить IPv6 (из за IPv6 могут быть проблемы с сетевым доступом к tomcat)"
+      ansible.builtin.sysctl:
+        name: "{{ item }}"
+        value: '1'
+        sysctl_file: /etc/sysctl.d/99-disable-ipv6.conf
+        state: present
+        reload: yes
+      loop:
+        - net.ipv6.conf.all.disable_ipv6
+        - net.ipv6.conf.default.disable_ipv6
+        - net.ipv6.conf.lo.disable_ipv6
+        - net.ipv6.conf.eth0.disable_ipv6
+      ignore_errors: yes

@@ -1,0 +1,155 @@
+---
+- name: "04 - Настройка веб-сервера (Nginx + Tomcat с ограничением доступа)"
+  hosts: guacamole_servers
+  gather_facts: yes
+  become: yes
+  vars:
+    # IP-адрес, который будет использоваться в сертификате и конфигурации Nginx - берется из глобальных переменных
+    # Каталог для SSL-сертификатов
+    server_AltNameIP: "{{ansible_host}}"  # Эта переменная нужна чтобы задать на какой ЙП подписывать сертификат
+    server_AltName: "IP:{{server_AltNameIP}},DNS:{{server_AltNameDNS}}" #Эта переменная нужна для добавления в сертификат альтернеймов, чтобы сертификат действовал и на ДНС и на ЙП имя
+    ssl_dir: "/etc/nginx/ssl"
+    ssl_cert: "{{ ssl_dir }}/guacamole.crt"
+    ssl_key: "{{ ssl_dir }}/guacamole.key"
+    # Имя сервиса Tomcat (установлен через apt, обычно tomcat11)
+    tomcat_conf_dir: "/etc/{{ tomcat_version }}"  # Каталог конфигурации Tomcat tomcat_version: "tomcat11"
+    server_xml: "{{ tomcat_conf_dir }}/server.xml"
+    proxy_pass_url: "http://127.0.0.1:8080/guacamole/"
+
+  tasks:
+
+    - name: "1. Настроить Tomcat на прослушивание только localhost (127.0.0.1:8080)"
+      ansible.builtin.replace:
+        path: "{{ server_xml }}"
+        regexp: '(Connector port="8080")(?!.*address=)'
+        replace: '\1 address="127.0.0.1"'
+        backup: yes
+      register: tomcat_config_changed
+
+    - name: "Добавить необходимую строчку в конфигурацию TomCat для корректного определения IP клиентов при использовании NginxProxy"
+      ansible.builtin.lineinfile:
+        path: "{{ server_xml }}"   # укажите правильный путь к server.xml
+        regexp: '^\s*<Valve className="org.apache.catalina.valves.RemoteIpValve"'
+        line: '        <Valve className="org.apache.catalina.valves.RemoteIpValve" internalProxies="127\.0\.0\.1" remoteIpHeader="x-forwarded-for" proxiesHeader="x-forwarded-by" protocolHeader="x-forwarded-proto" />'
+        insertbefore: '^\s*</Host>$'
+        state: present
+      register: tomcat_config_changed
+
+    - name: "Перезапустить Tomcat, если конфигурация изменена"
+      ansible.builtin.systemd:
+        name: "{{ tomcat_version }}"
+        state: restarted
+      when: tomcat_config_changed is changed
+
+
+    - name: "2. Установить Nginx"
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: yes
+      ignore_errors: yes   #Здесь есть вероятность - что Nginx упадет с ошибкой после установки, так как у нас отключен IPv6, то есть мы его устанавливаем нисмотря ни на что - продолжаем дальше
+
+    - name: "3. Создать каталог для SSL-сертификатов"
+      ansible.builtin.file:
+        path: "{{ ssl_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: "4. Сгенерировать самоподписной сертификат на 10 лет"
+      ansible.builtin.shell:
+        cmd: |
+          openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+            -keyout "{{ ssl_key }}" \
+            -out "{{ ssl_cert }}" \
+            -subj "/CN={{ server_AltNameIP }}" \
+            -addext "subjectAltName = "{{ server_AltName }}""
+        creates: "{{ ssl_cert }}"
+      register: openssl_result
+
+
+
+    - name: "Отладка - отчет по созданию сертификата (где и какие файлы созданы)"
+      ansible.builtin.debug:
+        msg: "{{item}}"
+      loop:
+        - "Сертификат успешно создан."
+        - "Файл приватного ключа: {{ ssl_key }}"
+        - "Файл сертификата: {{ ssl_cert }}"
+        - "Статус выполнения openssl: {{ openssl_result.rc }}"
+        - "Вывод команды (если есть): {{ openssl_result.stdout | default('(пусто)') }}"
+
+
+
+    - name: "5. Создать конфигурацию Nginx для проксирования на Tomcat (с перенаправлением 80→443)"
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/guacamole
+        mode: '0644'
+        content: |
+          server {
+              listen 80 default_server;
+              server_name {{ server_AltNameIP }} {{ server_AltNameDNS }};
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen 443 ssl default_server;
+              server_name {{ server_AltNameIP }} {{ server_AltNameDNS }} ;
+
+              ssl_certificate {{ ssl_cert }};
+              ssl_certificate_key {{ ssl_key }};
+
+              location / {
+                  proxy_pass {{ proxy_pass_url }};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 600s;
+                  proxy_send_timeout 600s;
+                  proxy_connect_timeout 60s;
+              }
+          }
+      notify: reload nginx
+
+
+    - name: "6. Включить сайт (создать символическую ссылку в sites-enabled)"
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/guacamole
+        dest: /etc/nginx/sites-enabled/guacamole
+        state: link
+
+    - name: "7. Удалить дефолтный сайт (чтобы избежать конфликтов)"
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      ignore_errors: yes
+
+    - name: "8. Проверить конфигурацию Nginx"
+      ansible.builtin.command:
+        cmd: nginx -t
+      register: nginx_test
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "Вывести результат проверки конфигурации"
+      ansible.builtin.debug:
+        msg: "{{ nginx_test.stdout_lines }}"
+      when: nginx_test is succeeded
+
+    - name: "9. Перезапустить Nginx"
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+  handlers:
+    - name: reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+
+
+

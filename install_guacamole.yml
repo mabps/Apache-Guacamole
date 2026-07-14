@@ -1,0 +1,17 @@
+---
+- name: "Полная установка Apache Guacamole на Debian 13"
+  hosts: guacamole_servers
+  gather_facts: yes
+
+
+
+
+  tasks: []  # empty tasks, no tasks
+
+
+- import_playbook: playbooks/01-prepare-os.yml
+- import_playbook: playbooks/02-download-sources.yml
+- import_playbook: playbooks/03-build-and-install.yml
+- import_playbook: playbooks/04-deploy-webapp.yml
+- import_playbook: playbooks/05-setup-sql-base.yml
+- import_playbook: playbooks/06-plugin-deploy.yml

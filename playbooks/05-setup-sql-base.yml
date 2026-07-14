@@ -1,0 +1,180 @@
+---
+# Дефотные логины пароли в Apache Guacamole после устновки БД = guacadmin \ guacadmin
+
+
+
+- name: "05 - Настройка аутентификации через PostgreSQL"
+  hosts: guacamole_servers
+  gather_facts: yes
+  become: yes
+  vars:
+    # Параметры базы данных
+    db_name: "guacamole_db"
+    # Версия расширения JDBC (совпадает с основной версией Guacamole)
+    jdbc_version: "{{ guacamole_version }}"
+    jdbc_archive: "guacamole-auth-jdbc-{{ jdbc_version }}.tar.gz"
+    jdbc_url: "https://downloads.apache.org/guacamole/{{ jdbc_version }}/binary/{{ jdbc_archive }}"
+    jdbc_extract_dir: "{{ distr_dir }}/guacamole-auth-jdbc-{{ jdbc_version }}"
+    # Каталог расширений Guacamole
+    guacamole_extension_dir: "/etc/guacamole/extensions"
+    guacamole_lib_dir: "/etc/guacamole/lib"
+    guacamole_properties: "/etc/guacamole/guacamole.properties"
+
+  tasks:
+
+    - name: "Определение актуальной версии необходимого  (если явно не задана версия Guacomole)"
+      set_fact:
+        jdbc_version: "{{ lookup('pipe', 'curl -s https://api.github.com/repos/apache/guacamole-server/tags | grep -oP '\\\"name\\\":\\\"\\K[0-9.]+(?=\\\")' | head -1') }}"
+      when: jdbc_version is not defined or jdbc_version == ""
+
+
+    # ---------- Установка PostgreSQL ----------
+    - name: "Установка PostgreSQL и дополнительных пакетов"
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+          - libpq-dev
+          - acl   # для управления правами на сокет
+          - python3-psycopg2
+        state: present
+        update_cache: yes
+
+    - name: "Запуск и включение PostgreSQL"
+      systemd:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: "Создание базы данных {{ db_name }} (если не существует)"
+      become_user: postgres
+      shell: |
+        psql -tAc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || psql -c "CREATE DATABASE \"{{ db_name }}\""
+      args:
+        executable: /bin/bash
+      register: create_db_result
+      changed_when: "'CREATE DATABASE' in create_db_result.stdout"
+
+    - name: "Создание пользователя {{ postgresql_user }} (если не существует)"
+      become_user: postgres
+      shell: |
+        psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ postgresql_user }}'" | grep -q 1 || psql -c "CREATE USER \"{{ postgresql_user }}\" WITH PASSWORD '{{ postgresql_password }}' LOGIN"
+      args:
+        executable: /bin/bash
+      register: create_user_result
+      changed_when: "'CREATE ROLE' in create_user_result.stdout or 'CREATE USER' in create_user_result.stdout"
+
+    - name: "Назначение всех привилегий на базу данных {{ db_name }} для {{ postgresql_user }}"
+      become_user: postgres
+      shell: |
+        psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ postgresql_user }};"
+      args:
+        executable: /bin/bash
+      register: grant_db_result
+      changed_when: "'GRANT' in grant_db_result.stdout"
+
+    # ---------- Загрузка и распаковка JDBC-расширения ----------
+    - name: "Скачивание JDBC-расширения {{ jdbc_archive }}"
+      get_url:
+        url: "{{ jdbc_url }}"
+        dest: "{{ distr_dir }}/{{ jdbc_archive }}"
+        mode: '0644'
+      register: download_jdbc
+      until: download_jdbc is succeeded
+      retries: 3
+      delay: 5
+
+    - name: "Распаковка JDBC-расширения"
+      unarchive:
+        src: "{{ distr_dir }}/{{ jdbc_archive }}"
+        dest: "{{ distr_dir }}"
+        remote_src: yes
+        creates: "{{ jdbc_extract_dir }}"
+
+    # ---------- Инициализация схемы базы данных ----------
+    - name: "Выполнение SQL-скриптов инициализации схемы"
+      shell: |
+        cat {{ jdbc_extract_dir }}/postgresql/schema/*.sql | \
+        sudo -u postgres psql -d {{ db_name }} -f -
+      args:
+        executable: /bin/bash
+      register: init_schema
+      changed_when: "'CREATE TABLE' in init_schema.stdout or 'CREATE SEQUENCE' in init_schema.stdout"
+
+    - name: "Назначение прав ALL на все таблицы (через shell)"
+      become_user: postgres
+      shell: |
+        psql -d "{{ db_name }}" -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO \"{{ postgresql_user }}\";" && \
+        psql -d "{{ db_name }}" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO \"{{ postgresql_user }}\";"
+      register: grant_result
+      changed_when: "'GRANT' in grant_result.stdout"
+
+
+    - name: "Назначение прав SELECT, USAGE на все последовательности (через shell)"
+      become_user: postgres
+      shell: |
+        psql -d "{{ db_name }}" -c "GRANT SELECT, USAGE ON ALL SEQUENCES IN SCHEMA public TO \"{{ postgresql_user }}\";" && \
+        psql -d "{{ db_name }}" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, USAGE ON SEQUENCES TO \"{{ postgresql_user }}\";"
+      register: seq_grant_result
+      changed_when: "'GRANT' in seq_grant_result.stdout"
+
+
+    # ---------- Копирование JAR-файлов расширения ----------
+    - name: "Создание каталога - {{ guacamole_extension_dir }} - для расширений (если отсутствует)"
+      file:
+        path: "{{ guacamole_extension_dir }}"
+        state: directory
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0755'
+
+    - name: "Копирование JAR-файлов расширения в {{ guacamole_extension_dir }}"
+      copy:
+        src: "{{ jdbc_extract_dir }}/postgresql/guacamole-auth-jdbc-postgresql-{{ jdbc_version }}.jar"
+        dest: "{{ guacamole_extension_dir }}/"
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0644'
+        remote_src: true
+      notify: restart tomcat
+
+
+    - name: "Скачать JDBC-драйвер PostgreSQL URL = {{postgresql_jdbc_driver_url}}"
+      ansible.builtin.get_url:
+        url: "{{ postgresql_jdbc_driver_url }}"
+        dest: "{{ distr_dir }}"
+        mode: "0644"
+        timeout: 30
+
+    - name: "Скопировать JDBC-драйвер в директорию {{guacamole_lib_dir}} и установить права a+rx"
+      ansible.builtin.copy:
+        src: "{{ distr_dir }}/{{postgresql_jdbc_driver_url | basename}}"
+        dest: "{{ guacamole_lib_dir }}"
+        remote_src: true
+        mode: "a+rx"
+
+
+    # ---------- Настройка guacamole.properties ----------
+    - name: "Добавление параметров PostgreSQL в guacamole.properties"
+      blockinfile:
+        path: "{{ guacamole_properties }}"
+        block: |
+          # PostgreSQL authentication
+          postgresql-hostname: localhost
+          postgresql-port: 5432
+          postgresql-database: {{ db_name }}
+          postgresql-username: {{ postgresql_user }}
+          postgresql-password: {{ postgresql_password }}
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - PostgreSQL"
+        create: yes
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: u+rw,g+r,o-rwx            # Важно!!! - та как мы в конфиге храним пароли, то максимально ограничить доступ к данному конфигу
+      notify: restart tomcat
+
+    # ---------- Перезапуск Tomcat (обработчик) ----------
+  handlers:
+    - name: restart tomcat
+      systemd:
+        name: "{{ tomcat_version | default('tomcat11') }}"
+        state: restarted

@@ -1,0 +1,165 @@
+---
+
+# Ссылка на описание плагнов которые будут установлены
+#https://guacamole.apache.org/doc/gug/recording-playback.html
+#https://guacamole.apache.org/doc/gug/totp-auth.html
+#https://guacamole.apache.org/doc/gug/auth-restrict.html
+
+
+- name: "06 - Установка расширений Guacamole (запись сессий, TOTP, ограничения)"
+  hosts: guacamole_servers
+  gather_facts: yes
+  become: yes
+  vars:
+    # Базовый URL для загрузки бинарных файлов расширений
+    base_download_url: "https://downloads.apache.org/guacamole/{{ guacamole_version }}/binary"
+    # Список расширений для установки
+    extensions:
+      - { name: "guacamole-history-recording-storage", archive: "guacamole-history-recording-storage-{{ guacamole_version }}.tar.gz" }
+      - { name: "guacamole-auth-totp", archive: "guacamole-auth-totp-{{ guacamole_version }}.tar.gz" }
+      - { name: "guacamole-auth-restrict", archive: "guacamole-auth-restrict-{{ guacamole_version }}.tar.gz" }
+    # Директория расширений Guacamole
+    guacamole_extension_dir: "/etc/guacamole/extensions"
+    guacamole_properties: "/etc/guacamole/guacamole.properties"
+    guacamole_records_dir: "/guac_records"   # Здесь будут храниться записи сеансов пользователей которые работают через Guacamole, НЕОБХОДИМО!!! в настройках подключения указывать папки хранения видеозаписи: ${HISTORY_PATH}/${HISTORY_UUID}название записи лучше делать с таким именем = ${GUAC_USERNAME}_${GUAC_DATE}_${GUAC_TIME}_rec . Важно !!! - чтобы в разделе History в интерфейсе Guacamole вы могли просмотреть записи - они должны иметь название ${HISTORY_UUID}, именно название содержащее UUID - позволяет сопоставить конкретное событие подключение и видеозапись, и позволяет через интерфейс просматривать такую видеозапись. По умолчанию ${HISTORY_PATH} - ведет в папку /var/lib/guacamole/recordings.  Так же нужно чтобы на эту папку были права на чтения у пользоваеля tomcat
+    guacamole_transfer_dir: "/guac_transfer"  # эта папка будет подключаться как сетевой диск при RDP подключении, в настройках подключения рекомендуется указывать путь: /guac_transfer/${GUAC_USERNAME}
+
+  tasks:
+    - name: "1. Определение актуальной версии (если не задана)"
+      set_fact:
+        guacamole_version: "{{ lookup('pipe', 'curl -s https://api.github.com/repos/apache/guacamole-server/tags | grep -oP '\\\"name\\\":\\\"\\K[0-9.]+(?=\\\")' | head -1') }}"
+      when: guacamole_version is not defined or guacamole_version == ""
+
+    - name: "2. Вывод версии Guacamole"
+      debug:
+        msg: "Установка расширений для Guacamole версии {{ guacamole_version }}"
+
+    - name: "3. Создание директории для расширений (если не существует)"
+      file:
+        path: "{{ guacamole_extension_dir }}"
+        state: directory
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0755'
+
+    - name: "4. Скачивание и распаковка расширений"
+      block:
+        - name: "4.1 Скачивание архива {{ item.archive }}"
+          get_url:
+            url: "{{ base_download_url }}/{{ item.archive }}"
+            dest: "{{ distr_dir }}/{{ item.archive }}"
+            mode: '0644'
+          register: download_result
+          until: download_result is succeeded
+          retries: 3
+          delay: 5
+          loop: "{{ extensions }}"
+          loop_control:
+            loop_var: item
+
+        - name: "4.2 Распаковка архива {{ item.archive }}"
+          unarchive:
+            src: "{{ distr_dir }}/{{ item.archive }}"
+            dest: "{{ distr_dir }}"
+            remote_src: yes
+            creates: "{{ distr_dir }}/{{ item.name }}-{{ guacamole_version }}"
+          loop: "{{ extensions }}"
+          loop_control:
+            loop_var: item
+
+    - name: "5. Копирование JAR-файлов расширений в {{ guacamole_extension_dir }}"
+      copy:
+        src: "{{ distr_dir }}/{{ item.name }}-{{ guacamole_version }}/{{ item.name }}-{{ guacamole_version }}.jar"
+        dest: "{{ guacamole_extension_dir }}/"
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0644'
+        remote_src: true
+      loop: "{{ extensions }}"
+      loop_control:
+        loop_var: item
+      notify: restart tomcat
+
+    - name: "6. Настройка guacamole.properties для плагина TOTP (при необходимости)"
+      blockinfile:
+        path: "/etc/guacamole/guacamole.properties"
+        block: |
+          # TOTP authentication
+          totp-issuer: Guacamole
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - TOTP"
+        create: yes
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0644'
+      notify: restart tomcat
+
+    - name: "7. Настройка guacamole.properties для плагина Connection Restriction (при необходимости)"
+      blockinfile:
+        path: "/etc/guacamole/guacamole.properties"
+        block: |
+          # Advanced restrictions
+          restrict-enabled: true
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - RESTRICT"
+        create: yes
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0644'
+      notify: restart tomcat
+
+
+    - name: "Создание директорий для Хранения видеозаписи и Сетевого диска для обмена"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: a+rwx                  # полные права для всех, внутри папки будут автоматически создаваться подпапки - которые уже будут иметь другого владельца и другие права (скорее всего владельцем будет пользоваетль daemon с запредом на доступ других пользователей)
+      loop:
+        - "{{guacamole_records_dir}}"
+        - "{{guacamole_transfer_dir}}"
+
+    - name: "Редактирования настройки Guacomole - указание что записи надо хранить в папке: "
+      ansible.builtin.lineinfile:
+        path: "{{ guacamole_properties }}"   # по умолчанию /etc/guacamole/guacamole.properties
+        line: "recording-search-path: {{guacamole_records_dir}}"
+        insertafter: EOF                     # добавит в конец файла
+        create: no                           # предполагаем, что файл уже существует (можно сменить на yes, если нужно)
+        regexp: '^recording-search-path:'    # заменяет существующую строку, если она есть
+        state: present
+
+# Костыль!!!
+# Так как демон guacd запускается от имени пользователя daemon  а интерфейс системы работает от tomcat11  - то возникает проблема с просмотром видео санса подключения
+# Ставим бит автонаследования прав для папки, все что будет там создано - будет иметь наследуемые права, относительно верхней папки, для группы пользователей. Ну и перезаписываем нужные нам права
+# таким образом в разделе History в интерфейсе будут отражаться записи
+#
+
+    - name: "Костыль!!! Включить setgid-бит на все каталоги внутри целевой директории (чтобы новые файлы наследовали группу)"
+      shell: |
+        find "{{ guacamole_records_dir }}" -type d -exec chmod g+s {} \;
+      register: setgid_result
+      changed_when: setgid_result.stdout != "" or setgid_result.stderr != ""
+
+    - name: "Костыль!!! Назначить общую группу на целевую директорию и все подкаталоги"
+      file:
+         path: "{{ guacamole_records_dir }}"
+         group: "{{ tomcat_group }}"
+         recurse: true
+
+    - name: "Костыль !!! - делаем доступ к папке с видеозаписями для Tomcat"
+      ansible.builtin.file:
+         path: "{{guacamole_records_dir}}"
+         mode: 'g+rwx'
+         recurse: yes
+
+    - name: "Костыль !!! - делаем доступ к папке с видеозаписями для Tomcat"
+      ansible.builtin.file:
+         path: "{{guacamole_records_dir}}"
+         mode: 'a+rwx'
+         recurse: yes
+
+
+  handlers:
+    - name: restart tomcat
+      systemd:
+        name: "{{ tomcat_version | default('tomcat11') }}"
+        state: restarted
